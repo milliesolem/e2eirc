@@ -1,176 +1,109 @@
 package e2eirc
 
 import (
-	"crypto/rsa"
-	"fmt"
-	"strings"
+	"crypto/ecdh"
+	"crypto/ed25519"
+	"time"
 )
 
+const (
+	maxInbox        = 32               // undecryptable lines held per peer
+	maxPendingPeers = 64               // peers with an outstanding handshake
+	maxPairKeys     = 2                // recent handshakes kept for DM decryption
+	maxPartialSize  = 64 * 1024        // bytes buffered for one chunked message
+	helloResend     = 30 * time.Second // minimum gap between HELLOs to one peer
+	handshakeExpiry = 10 * time.Minute // outstanding HELLO is abandoned after this
+	outboxExpiry    = 2 * time.Minute  // held private messages are dropped after this
+	partialExpiry   = 15 * time.Second // incomplete chunked messages are dropped after this
+)
+
+// pairKeys are the directional private-message keys from one handshake.
+type pairKeys struct {
+	send *sendKey
+	recv *recvKey
+}
+
+type outboundDM struct {
+	text  string
+	since time.Time
+}
+
+// partialMsg is a chunked message being reassembled.
+type partialMsg struct {
+	next  uint64 // counter the next chunk must carry
+	buf   []byte
+	parts int
+	since time.Time
+}
+
+// peer is everything we know about another IRC user in this session.
 type peer struct {
-	id   string
-	name string
+	conn *connection
+	nick string // display form, as last seen from the server
 
-	conn                *connection
-	unencryptedMessages []*message
+	identity ed25519.PublicKey // learned through a verified, approved handshake
+	bcast    *recvKey          // the peer's broadcast key (channel messages)
+	pairs    []*pairKeys       // newest first
 
-	decryptionKey []byte
-	publicKey     *rsa.PublicKey
+	// A handshake we initiated and are waiting on.
+	eph       *ecdh.PrivateKey
+	ephSince  time.Time
+	helloSent time.Time
 
-	trusted     bool
-	handshaking bool
+	inbox        []*ircMessage // lines we could not decrypt yet
+	inboxDropped int
+
+	outbox         []outboundDM // private messages waiting for keys
+	outboxNotified bool
+
+	partials map[string]*partialMsg // keyed by AAD
+
+	declinedNotified bool
 }
 
-func (c *connection) loadRegistry() {
-	c.peerRegistry = map[string]*peer{}
+func newPeer(c *connection, nick string) *peer {
+	return &peer{conn: c, nick: nick, partials: map[string]*partialMsg{}}
 }
 
-func (c *connection) peerWithID(id string) *peer {
-	peer := c.peerRegistry[id]
-
-	if peer == nil {
-		peer = c.newPeerWithID(id)
+func (p *peer) fp() string {
+	if p.identity == nil {
+		return ""
 	}
-
-	return peer
+	return fingerprint(p.identity)
 }
 
-func (c *connection) newPeerWithID(id string) *peer {
-	p := peer{id: id, conn: c}
-	p.name = id
-	p.unencryptedMessages = []*message{}
-	c.peerRegistry[id] = &p
-	return &p
-}
+func (p *peer) canSendPrivate() bool { return len(p.pairs) > 0 }
 
-func (p *peer) decryptPrivMSG(m *message) {
-	msgIndex := m.offset + 2
-
-	msg := strings.Join(m.components[msgIndex:], " ")
-	trimmedComponents := m.components[:msgIndex]
-
-	plaintext := true
-
-	// Extract Message
-	msg = msg[1 : len(msg)-2]
-
-	// Check if RSA Message
-	if strings.HasPrefix(msg, "RSA ") {
-		msg = p.conn.rsaDecrypt(msg)
-		plaintext = false
-	}
-
-	// Check for non encrypted control command
-	if strings.HasPrefix(msg, "CTRL ") {
-		p.recieveControlCommand(msg)
-		return
-	}
-
-	// Determine if we can decrypt or if we have to request the decryption key
-	if !p.canDecrypt() {
-		p.beginHandshake()
-		p.unencryptedMessages = append(p.unencryptedMessages, m)
-		return
-	}
-
-	// Decrypt Message
-	decMsg := p.aesDecryptString(msg)
-	if decMsg != msg {
-		plaintext = false
-	}
-
-	msg = decMsg
-
-	// Check for encrypted control command
-	if strings.HasPrefix(msg, "CTRL ") {
-		p.recieveControlCommand(msg)
-		return
-	}
-
-	// Properly Name Sender
-	m.senderComponents[0] = p.name
-
-	sender := strings.Join(m.senderComponents, "!~")
-	trimmedComponents[0] = ":" + sender
-
-	// Add cleartext warning
-	if plaintext {
-		msg += " [SENT AS CLEARTEXT]"
-	}
-
-	// Rebuild Message string
-	result := strings.Join(trimmedComponents, " ") + " :" + msg + "\n"
-
-	p.conn.writeClient([]byte(result))
-}
-
-func (p *peer) canDecrypt() bool {
-	return p.decryptionKey != nil
-}
-
-//
-// Handshakes
-//
-
-func (p *peer) beginHandshake() {
-	p.sendControlCommand("HANDSHAKE", p.conn.publicKeyBase64())
-	p.handshaking = true
-}
-
-//
-// Control Commands
-//
-
-// Basics
-func (p *peer) sendControlCommand(command string, payload string) {
-	msg := "CTRL " + command
-
-	if payload != "" {
-		msg += " " + payload
-	}
-
-	p.sendPrivateMessage(msg)
-}
-
-func (p *peer) sendControlCommandRSA(command string, payload string) {
-	msg := "CTRL " + command
-
-	if payload != "" {
-		msg += " " + payload
-	}
-
-	msg = p.rsaEncrypt(msg)
-
-	p.sendPrivateMessage(msg)
-}
-
-func (p *peer) sendPrivateMessage(message string) {
-	msg := "PRIVMSG " + p.id + " :" + message
-	p.conn.writeServer([]byte(msg + "\n"))
-}
-
-//
-// After the handshake, decrypt the messages that were sent previously
-//
-func (p *peer) decryptUnencryptedMessages() {
-	if p.canDecrypt() {
-		for _, message := range p.unencryptedMessages {
-			message.decrypt()
-		}
-
-		p.unencryptedMessages = []*message{}
+// addPair installs keys from a completed handshake, keeping a couple of
+// recent ones so simultaneous or replayed handshakes do not strand messages.
+func (p *peer) addPair(send *sendKey, recv *recvKey) {
+	p.pairs = append([]*pairKeys{{send: send, recv: recv}}, p.pairs...)
+	for len(p.pairs) > maxPairKeys {
+		old := p.pairs[len(p.pairs)-1]
+		old.send.wipe()
+		old.recv.wipe()
+		p.pairs = p.pairs[:len(p.pairs)-1]
 	}
 }
 
-func (p *peer) displayName() string {
-	fingerprintHex := p.publicKeyFingerprintSha1()
-	fingerprintChunks := make([]string, len(fingerprintHex)/2)
-	for i := range fingerprintChunks {
-		fingerprintChunks[i] = string(fingerprintHex[(i*2)]) + string(fingerprintHex[(i*2)+1])
+func (p *peer) setBroadcastKey(key []byte, ctr uint64) {
+	p.bcast.wipe()
+	p.bcast = &recvKey{key: key, last: ctr}
+}
+
+// wipe discards all key material and pending state.
+func (p *peer) wipe() {
+	p.identity = nil
+	p.bcast.wipe()
+	p.bcast = nil
+	for _, pk := range p.pairs {
+		pk.send.wipe()
+		pk.recv.wipe()
 	}
-
-	fingerprint := strings.Join(fingerprintChunks, ":")
-
-	fmt.Println(fingerprint, fingerprintHex)
-
-	return p.name + " (" + fingerprint + ")"
+	p.pairs = nil
+	p.eph = nil
+	p.inbox = nil
+	p.inboxDropped = 0
+	p.outbox = nil
+	p.partials = map[string]*partialMsg{}
 }

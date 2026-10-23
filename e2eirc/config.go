@@ -13,17 +13,18 @@ type config struct {
 	dirPath     string
 }
 
-var sharedConfig = config{}
+var sharedConfig config
 
+// ParseFlags populates the shared configuration from the command line.
 func ParseFlags() {
 	flag.IntVar(&sharedConfig.ircPort, "port", 6667, "The port of the remote IRC server")
-	flag.StringVar(&sharedConfig.ircHost, "host", "0.0.0.0", "The host of the remote IRC server")
+	flag.StringVar(&sharedConfig.ircHost, "host", "127.0.0.1", "The host of the remote IRC server")
 
-	flag.IntVar(&sharedConfig.localPort, "local_port", 6666, "The local IRC port to connect to")
-	flag.StringVar(&sharedConfig.localHost, "local_host", "0.0.0.0", "The address to listen on")
+	flag.IntVar(&sharedConfig.localPort, "local_port", 6666, "The local port your IRC client connects to")
+	flag.StringVar(&sharedConfig.localHost, "local_host", "127.0.0.1", "The local address to listen on")
 
-	flag.StringVar(&sharedConfig.keyPassword, "key", "", "The password to decrypt your private key, leave blank for STDIN")
-	flag.StringVar(&sharedConfig.dirPath, "dir", "", "The path to the directory containing your private and trusted keys, leave blank for ~/.e2eirc")
+	flag.StringVar(&sharedConfig.keyPassword, "key", "", "The password protecting your identity key (visible to other local users via the process list; leave blank to be prompted)")
+	flag.StringVar(&sharedConfig.dirPath, "dir", "", "The directory containing your identity key and trusted keys, leave blank for ~/.e2eirc")
 
 	flag.Parse()
 }

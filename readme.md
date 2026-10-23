@@ -1,86 +1,119 @@
 # E2EIRC
 
-E2EIRC allows you to create end to end encrpyted chat rooms on Regular (Unmodified) IRC servers and your favorite IRC client.
+E2EIRC lets you hold end-to-end encrypted conversations on regular, unmodified
+IRC servers with your favourite IRC client.
 
-By default E2EIRC runs a local server on port 6666. After starting up the e2eirc server connect your IRC client to it and it will act as a intermediary between the IRC server and your local client.
+It runs a small proxy on your machine (port 6666 by default). You point your
+IRC client at the proxy, the proxy connects to the real IRC server, and it
+encrypts the text of your messages on the way out and decrypts other
+e2eirc users' messages on the way in. Everything else (nicks, channels,
+joins, modes) passes through untouched.
 
-# The Gist
+## How it works
 
-Note: This document was written quickly, it assumes you have a good grasp of both AES and RSA encryption.
+* **Identity.** On first run you get an Ed25519 identity key, stored in
+  `~/.e2eirc/identity.key` encrypted with a password of your choice
+  (Argon2id + XChaCha20-Poly1305). Its SHA-256 fingerprint is what other
+  users verify.
+* **Channel messages** are encrypted with a per-session *broadcast key*
+  using ChaCha20-Poly1305. Every message carries a counter, and the
+  channel name is bound into the authenticated data, so the server cannot
+  replay a message, reorder it, or move it into another channel or
+  conversation.
+* **Private messages** use a separate pairwise key per peer derived from the
+  key exchange, so trusting someone for channel traffic never gives them
+  your private conversations with others.
+* **Key exchange.** When your proxy sees a message it cannot read, it sends
+  the sender a `HELLO`: an ephemeral X25519 key signed with your identity
+  key, bound to both nicks. The sender answers with a `KEYEX` carrying its
+  own signed ephemeral key and its broadcast key wrapped under the shared
+  secret. Both sides also derive the private-message keys from the same
+  exchange.
+* **Trust.** Keys are only exchanged with identities you have approved.
+  The first time a nick presents an identity, the proxy shows you its
+  fingerprint through a pseudo-user called `$E2ECtrl` and asks you to
+  confirm it. The approval is recorded as a *(nick, fingerprint)* pin in
+  `~/.e2eirc/trusted_keys` (encrypted with a key derived from your
+  identity). If a known nick later shows up with a different key, or a
+  trusted key shows up under a different nick, you are warned loudly and
+  asked again.
+* Unencrypted messages from other users are delivered with a
+  `[CLEARTEXT]` prefix so they can never be mistaken for authenticated
+  text.
 
-All messages sent are encrypted by AES256 with a session key unique to each user. The session keys are exchanged using RSA encryption. Each user has a persistent RSA public key. In order for the session key to be exchanged the public key of the requesting use MUST be first approved by the user. Once a key is trusted it will automatically provide the AES key.
+### Talking to the proxy
 
-# How does it work?
+Send private messages to `$E2ECtrl` in your IRC client:
 
-The IRC client connects to the e2eirc process on port 6666. The e2eirc process creates a standard connection to the IRC server of your choice.
+| Command | Effect |
+|---|---|
+| `TRUST <nick> <fingerprint prefix>` | approve the pending key request from `nick`; the prefix (at least 8 characters) must match the fingerprint shown, so an approval is always tied to the key you verified |
+| `TRUST <nick>` | with nothing pending: start a key exchange with `nick`, forgetting an earlier refusal |
+| `NO [nick]` | refuse the pending request; it is ignored for the rest of the session |
+| `UNTRUST <nick>` | forget that nick's key, drop its session keys and rotate your broadcast key |
+| `LISTTRUST` | show trusted keys and the state of this session's peers |
+| `REGENKEY` | rotate your broadcast key; peers re-request it automatically |
+| `HELP` | list the commands |
 
-The client can then communicate directly with the IRC server through the e2eirc process and join a channel, set a nickname, etc just as it would if it were connected directly.
+The proxy is the only thing that can speak as `$E2ECtrl`; lines the server
+attributes to that name are dropped.
 
-When a user sends a message the message is intercepted by the e2eirc server and encrypted using the user's own AES key (which changes every session).
+## Should I use this?
 
-The encrypted message is then sent to the IRC server.
+Maybe. It is a working proof of concept of end-to-end encryption for both
+group chats and private chats on top of an untrusted server, and the code is
+small enough to read in an afternoon. It has had a careful design and code
+review, but it has not had an independent professional audit. Treat it as
+beta software.
 
-On the other end another user running the e2eirc server will recieve the message. It'll attempt to decrypt the message using the last known AES key of the sender. However if no AES key is known, or the AES decryption is unsuccessful it will request the AES key from the sender via private message.
+What it does **not** do: it does not make you anonymous. Your nick, IP
+address, which channels you are in and when you talk are all visible to
+the server. Anyone you trust for a channel can read everything you post to
+channels they are in, and could repost it. The server can still drop or
+delay messages.
 
-It will also send over it's public key during the handshake. The public key is validated to ensure that it has been seen before. If so the AES encryption key is encrypted with the user's RSA Public Key and sent back to the user.
+## Install
 
-If the public key has not been seen before it is consiered "untrusted". And the user will be required to approve the key via private message from the user $E2ECtrl.
-
-# Should I use this?
-
-Maybe. Take a look at it, the technology will help you understand how e2e encryption works. It is also a good proof of concept of E2E encryption on both group chats and private chats.
-
-The security, however, is not guarenteed.
-
-Please note that this does not make you anonymous. Your nicknames, ip addresses, etc will all be visable in clear text. What this will do, however, is obscure the content of your mesages. 
-
-# Install
-
-You need to have go installed in order to run this package. It is possible to create pre-built binaries using go, however that isn't the purpose of this project.
-
-Once you have go installed run the following command
+You need Go 1.24 or newer.
 
 ```
-$ go get github.com/novus0rdo/e2eirc        # download the package
-$ go install github.com/novus0rdo/e2eirc    # install it in your gopath bin
+$ git clone https://github.com/Novus0rdo/e2eirc
+$ cd e2eirc
+$ go build -o e2eirc .
 ```
 
-This will create a binary in your `$GOPATH/bin` directory.
-
-If you have your `$GOPATH/bin` directory in your `PATH` then you can run
+Run it with the address of the IRC server you want to talk to:
 
 ```
-$ e2eirc -host chat.freenode.net -port 6667  # connects to freenode
+$ ./e2eirc -host irc.libera.chat -port 6667
 ```
 
-You will be asked to enter a password. This password will act as your private key encryption key, it is critical that you keep it safe but also remember it.
+Flags:
 
-It should look like the below:
+| Flag | Default | Meaning |
+|---|---|---|
+| `-host` | `127.0.0.1` | IRC server to relay to |
+| `-port` | `6667` | IRC server port |
+| `-local_host` | `127.0.0.1` | address the proxy listens on |
+| `-local_port` | `6666` | port the proxy listens on |
+| `-dir` | `~/.e2eirc` | where the identity key and trusted keys live |
+| `-key` | | identity password; leave unset to be prompted. Other local users can see command lines, so prefer the prompt |
 
-```
+On first start you choose a password for your identity key. If you lose it
+you lose that identity and will need to be re-trusted by your contacts.
 
-███████╗██████╗ ███████╗██╗██████╗  ██████╗
-██╔════╝╚════██╗██╔════╝██║██╔══██╗██╔════╝
-█████╗   █████╔╝█████╗  ██║██████╔╝██║
-██╔══╝  ██╔═══╝ ██╔══╝  ██║██╔══██╗██║
-███████╗███████╗███████╗██║██║  ██║╚██████╗
-╚══════╝╚══════╝╚══════╝╚═╝╚═╝  ╚═╝ ╚═════╝
-Version: 0.0.1-Beta
+Then connect your IRC client to `127.0.0.1` port `6666`, join a channel
+with other e2eirc users, and say hello. When someone's proxy asks for your
+key you will get a message from `$E2ECtrl`; compare the fingerprint with
+them over a channel you already trust and answer `TRUST`.
 
-WARNING: YOU ARE ON A BETA RELEASE!
-THE PURPOSE OF THIS RELEASE IS FOR EVALUATION,
-SECURITY RESEARCH, AND DEVELOPMENT! THE SECURTIY
-OF THIS RELEASE IS NOT GUARENTEED IN ANY WAY.
-DO NOT USE THIS VERSION FOR MISSION CRITICAL
-COMMUNICATIONS. YOU MAY NOT BE SAFE.
+Note that the proxy itself talks to the IRC server in the clear. Use a
+server that offers TLS, or an SSH tunnel, if you want transport encryption
+as well.
 
-Generating 2048 bit private key. Please wait... Done
-Enter a new password for your private key. If you lose it you won't be able to confirm your identity on chat:
+### Upgrading from 0.0.x
 
-```
-
-Enter your password and press enter.
-
-If all looks good, connect your IRC client to 0.0.0.0/6666 (or 0.0.0.0 and port 6666).
-
-If you connected up to freenode join the #e2eirc channel and send a message to try it out!
+Version 0.2 replaces the RSA/AES-CFB protocol with the design described
+above; the two cannot talk to each other. Old `private_key.pem` and
+`trusted_keys` files are moved aside (`.old`) and a new identity is
+created on first start.
